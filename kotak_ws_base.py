@@ -163,12 +163,16 @@ def login():
     client.on_close = on_close
     client.on_open = on_open
 
-    otp = pyotp.TOTP(CONFIG["totp_secret"]).now()
+    from config_loader import is_complete, missing_fields
+    if not is_complete(CONFIG):
+        raise ValueError("Missing credentials: " + ", ".join(missing_fields(CONFIG)))
+
+    otp = pyotp.TOTP(str(CONFIG["totp_secret"]).strip()).now()
     print(f"[AUTH] generated TOTP: {otp}")
 
     resp1 = client.totp_login(
-        mobile_number=CONFIG["mobile_number"],
-        ucc=CONFIG["ucc"],
+        mobile_number=str(CONFIG["mobile_number"]).strip(),
+        ucc=str(CONFIG["ucc"]).strip(),
         totp=otp,
     )
     print(f"[AUTH] totp_login    : {resp1}")

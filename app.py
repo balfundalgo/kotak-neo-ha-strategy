@@ -147,14 +147,117 @@ class App(ctk.CTk):
                                    segmented_button_selected_color=CLR_HEADER,
                                    corner_radius=10)
         self.tabs.pack(fill="both", expand=True, padx=16, pady=(6, 16))
-        for t in ("Positions", "Log", "Settings"):
+        for t in ("Credentials", "Positions", "Log", "Settings"):
             self.tabs.add(t)
 
+        self._build_credentials(self.tabs.tab("Credentials"))
         self._build_positions(self.tabs.tab("Positions"))
         self._build_log(self.tabs.tab("Log"))
         self._build_settings(self.tabs.tab("Settings"))
 
     # ------------------------------------------------------------------
+    def _build_credentials(self, parent):
+        from config_loader import CONFIG, FIELDS, config_path, is_complete
+
+        box = ctk.CTkFrame(parent, fg_color=CLR_CARD, corner_radius=10)
+        box.pack(fill="x", padx=16, pady=16)
+
+        ctk.CTkLabel(box, text="Kotak Neo credentials",
+                     font=("Helvetica", 16, "bold"),
+                     text_color=CLR_TEXT).grid(row=0, column=0, columnspan=3,
+                                               sticky="w", padx=18, pady=(16, 4))
+        ctk.CTkLabel(box, text="Saved to config.json beside the application. "
+                              "Nothing is stored inside the EXE.",
+                     font=("Helvetica", 11),
+                     text_color=CLR_MUTED).grid(row=1, column=0, columnspan=3,
+                                                sticky="w", padx=18, pady=(0, 12))
+
+        self.cred_entries = {}
+        self.cred_show = {}
+        for i, (key, label, secret) in enumerate(FIELDS):
+            ctk.CTkLabel(box, text=label, font=("Helvetica", 12),
+                         text_color=CLR_TEXT, width=230, anchor="w").grid(
+                row=2 + i, column=0, sticky="w", padx=(18, 8), pady=7)
+
+            ent = ctk.CTkEntry(box, width=340, height=34,
+                               show="*" if secret else "")
+            ent.insert(0, str(CONFIG.get(key, "")))
+            ent.grid(row=2 + i, column=1, sticky="w", pady=7)
+            self.cred_entries[key] = ent
+
+            if secret:
+                self.cred_show[key] = False
+
+                def _toggle(k=key):
+                    self.cred_show[k] = not self.cred_show[k]
+                    self.cred_entries[k].configure(
+                        show="" if self.cred_show[k] else "*")
+
+                ctk.CTkButton(box, text="show", width=58, height=30,
+                              fg_color="#9ca3af", hover_color="#6b7280",
+                              command=_toggle).grid(row=2 + i, column=2,
+                                                    padx=8, pady=7)
+
+        n = len(FIELDS) + 2
+        btns = ctk.CTkFrame(box, fg_color="transparent")
+        btns.grid(row=n, column=0, columnspan=3, sticky="w", padx=18, pady=(14, 18))
+
+        ctk.CTkButton(btns, text="SAVE CREDENTIALS", width=190, height=38,
+                      font=("Helvetica", 13, "bold"),
+                      fg_color=CLR_HEADER, hover_color="#1541a8",
+                      command=self.save_credentials).pack(side="left")
+
+        ctk.CTkButton(btns, text="TEST TOTP", width=130, height=38,
+                      font=("Helvetica", 13),
+                      fg_color="#6b7280", hover_color="#4b5563",
+                      command=self.test_totp).pack(side="left", padx=10)
+
+        self.lbl_cred = ctk.CTkLabel(btns, text="", font=("Helvetica", 12))
+        self.lbl_cred.pack(side="left", padx=14)
+
+        ctk.CTkLabel(parent, text=f"config.json location:\n{config_path()}",
+                     font=("Menlo", 10), text_color=CLR_MUTED,
+                     justify="left").pack(anchor="w", padx=24)
+
+        if not is_complete(CONFIG):
+            self.after(400, lambda: self.tabs.set("Credentials"))
+
+    def save_credentials(self):
+        from config_loader import save_config, is_complete, missing_fields
+        vals = {k: e.get().strip() for k, e in self.cred_entries.items()}
+
+        mpin = vals.get("mpin", "")
+        if mpin and not (mpin.isdigit() and len(mpin) == 6):
+            self.lbl_cred.configure(text="MPIN must be exactly 6 digits",
+                                    text_color=CLR_RED)
+            return
+
+        path = save_config(vals)
+        if is_complete():
+            self.lbl_cred.configure(text="Saved. Ready to start.",
+                                    text_color=CLR_GREEN)
+        else:
+            self.lbl_cred.configure(
+                text="Saved, still missing: " + ", ".join(missing_fields()),
+                text_color=CLR_AMBER)
+        self.log(f"[CRED] saved to {path}")
+
+    def test_totp(self):
+        seed = self.cred_entries["totp_secret"].get().strip()
+        if not seed:
+            self.lbl_cred.configure(text="Enter the TOTP secret first",
+                                    text_color=CLR_AMBER)
+            return
+        try:
+            import pyotp
+            code = pyotp.TOTP(seed).now()
+            self.lbl_cred.configure(
+                text=f"TOTP now: {code}  (must match your authenticator)",
+                text_color=CLR_GREEN)
+        except Exception as e:
+            self.lbl_cred.configure(text=f"Invalid TOTP secret: {e}",
+                                    text_color=CLR_RED)
+
     COLS = [("instrument", 250), ("side", 60), ("reference", 105), ("ltp", 105),
             ("state", 85), ("entry", 105), ("qty", 70),
             ("realized", 120), ("unrealized", 120), ("trades", 75)]
@@ -244,6 +347,15 @@ class App(ctk.CTk):
     def start(self):
         if self.running:
             return
+
+        from config_loader import is_complete, missing_fields
+        if not is_complete():
+            self.tabs.set("Credentials")
+            self.lbl_cred.configure(
+                text="Missing: " + ", ".join(missing_fields()),
+                text_color=CLR_RED)
+            return
+
         self.running = True
         self.stop_evt.clear()
         self.started_at = time.time()

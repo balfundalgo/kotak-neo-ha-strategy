@@ -1,56 +1,94 @@
 """
-Runtime config loader
-=====================
-Keeps credentials OUT of the EXE.
-
-Running from source  -> imports config.py normally.
-Running as an EXE    -> loads config.py from the folder containing the EXE.
-
-So each client gets: KotakHAStrategy.exe + their own config.py alongside it.
+Runtime credential store
+========================
+Credentials are entered in the GUI and saved to `config.json` beside the EXE.
 Nothing sensitive is compiled into the binary.
+
+Load order:
+    1. config.json  (written by the GUI)
+    2. config.py    (legacy / console use)
+    3. empty        -> GUI starts and asks for details
 """
 
 import os
 import sys
+import json
 import importlib.util
 
+CONFIG_FILE = "config.json"
 
-def _config_dir():
-    if getattr(sys, "frozen", False):          # PyInstaller bundle
+FIELDS = [
+    ("consumer_key",  "Access Token (API Dashboard)", False),
+    ("mobile_number", "Mobile Number (with +91)",     False),
+    ("ucc",           "UCC / Client Code",            False),
+    ("mpin",          "MPIN (6 digits)",              True),
+    ("totp_secret",   "TOTP Secret (setup key)",      True),
+]
+
+DEFAULT = {
+    "consumer_key": "", "mobile_number": "", "ucc": "",
+    "mpin": "", "totp_secret": "", "environment": "prod",
+}
+
+
+def app_dir():
+    """Folder containing the EXE (frozen) or this source file."""
+    if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def config_path():
+    return os.path.join(app_dir(), CONFIG_FILE)
+
+
 def load_config():
-    path = os.path.join(_config_dir(), "config.py")
+    cfg = dict(DEFAULT)
 
-    if not os.path.exists(path):
-        print("=" * 70)
-        print(" config.py NOT FOUND")
-        print("=" * 70)
-        print(f" Expected at: {path}")
-        print()
-        print(" Create a config.py in this folder containing CONFIG,")
-        print(" INDICES and SCRIPS. See config_template.py.")
-        print("=" * 70)
-        input(" Press Enter to exit...")
-        sys.exit(1)
+    path = config_path()
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                cfg.update(json.load(f))
+            return cfg
+        except Exception as e:
+            print(f"[CONFIG] could not read {path}: {e}")
 
-    spec = importlib.util.spec_from_file_location("user_config", path)
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
+    legacy = os.path.join(app_dir(), "config.py")
+    if os.path.exists(legacy):
+        try:
+            spec = importlib.util.spec_from_file_location("user_config", legacy)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            cfg.update(getattr(mod, "CONFIG", {}))
+        except Exception as e:
+            print(f"[CONFIG] could not read config.py: {e}")
 
-    missing = [k for k in ("CONFIG",) if not hasattr(mod, k)]
-    if missing:
-        print(f"config.py is missing: {', '.join(missing)}")
-        input("Press Enter to exit...")
-        sys.exit(1)
-
-    return (
-        mod.CONFIG,
-        getattr(mod, "INDICES", []),
-        getattr(mod, "SCRIPS", []),
-    )
+    return cfg
 
 
-CONFIG, INDICES, SCRIPS = load_config()
+def save_config(values):
+    """Persist credentials next to the EXE and update the live CONFIG."""
+    cfg = dict(CONFIG)
+    cfg.update(values)
+    with open(config_path(), "w") as f:
+        json.dump(cfg, f, indent=2)
+    CONFIG.clear()
+    CONFIG.update(cfg)          # same object, so login() sees new values
+    return config_path()
+
+
+def is_complete(cfg=None):
+    cfg = cfg or CONFIG
+    return all(str(cfg.get(k, "")).strip() for k, _, _ in FIELDS)
+
+
+def missing_fields(cfg=None):
+    cfg = cfg or CONFIG
+    return [lbl for k, lbl, _ in FIELDS if not str(cfg.get(k, "")).strip()]
+
+
+# Mutable module-level dict - the GUI updates this in place.
+CONFIG = load_config()
+INDICES = []
+SCRIPS = []
