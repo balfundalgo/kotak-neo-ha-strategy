@@ -597,5 +597,34 @@ class App(ctk.CTk):
             text_color=CLR_GREEN if net >= 0 else CLR_RED)
 
 
+def _crash(exc_type, exc, tb):
+    """Never vanish silently - write a log and show it."""
+    import traceback, os
+    txt = "".join(traceback.format_exception(exc_type, exc, tb))
+    try:
+        from config_loader import app_dir
+        path = os.path.join(app_dir(), "crash.log")
+    except Exception:
+        path = "crash.log"
+    try:
+        with open(path, "a") as f:
+            f.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} =====\n{txt}")
+    except Exception:
+        pass
+    print(txt)
+    try:
+        import tkinter.messagebox as mb
+        mb.showerror("Balfund - error",
+                     f"{exc}\n\nDetails written to:\n{path}")
+    except Exception:
+        pass
+
+
 if __name__ == "__main__":
-    App().mainloop()
+    sys.excepthook = _crash
+    try:
+        app = App()
+        app.report_callback_exception = _crash   # tkinter callback errors
+        app.mainloop()
+    except Exception:
+        _crash(*sys.exc_info())

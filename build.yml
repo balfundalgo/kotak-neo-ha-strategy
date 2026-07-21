@@ -36,8 +36,8 @@ jobs:
             --hidden-import=requests `
             --hidden-import=websocket `
             --hidden-import=websocket._app `
-            --collect-data customtkinter `
-            --collect-data darkdetect `
+            --collect-all customtkinter `
+            --collect-all darkdetect `
             --collect-all neo_api_client `
             --collect-all websocket `
             app.py

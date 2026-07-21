@@ -88,7 +88,20 @@ def missing_fields(cfg=None):
     return [lbl for k, lbl, _ in FIELDS if not str(cfg.get(k, "")).strip()]
 
 
+def ensure_file():
+    """Create a blank config.json on first run so it is easy to find/edit."""
+    path = config_path()
+    if not os.path.exists(path):
+        try:
+            with open(path, "w") as f:
+                json.dump(DEFAULT, f, indent=2)
+        except Exception:
+            pass
+    return path
+
+
 # Mutable module-level dict - the GUI updates this in place.
 CONFIG = load_config()
+ensure_file()
 INDICES = []
 SCRIPS = []
