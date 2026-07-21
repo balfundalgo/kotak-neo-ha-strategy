@@ -1,9 +1,21 @@
-# credentials - never commit
+# Credentials - written by the GUI, never commit
+config.json
 config.py
 
-__pycache__/
-*.pyc
+# Runtime
+crash.log
+*.log
+
+# PyInstaller
 build/
 dist/
 *.spec
-*.csv
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# macOS
+.DS_Store

@@ -1,7 +1,9 @@
 git+https://github.com/Kotak-Neo/Kotak-neo-api-v2.git@v2.0.2#egg=neo_api_client
 pyotp>=2.9.0
 pandas>=2.0.0
+numpy
 websocket-client
 requests
 customtkinter>=5.2.0
 darkdetect
+packaging

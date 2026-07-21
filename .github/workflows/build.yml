@@ -10,11 +10,9 @@ jobs:
     runs-on: windows-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -24,23 +22,35 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller==6.3.0
 
-      - name: Build EXE
+      - name: Build GUI EXE
         run: |
-          pyinstaller --onefile --console --name "KotakHAStrategy" `
-            --hidden-import=neo_api_client `
-            --hidden-import=pyotp `
-            --hidden-import=pandas `
-            --hidden-import=numpy `
-            --hidden-import=requests `
-            --hidden-import=websocket `
-            --hidden-import=websocket._app `
-            --collect-all neo_api_client `
-            --collect-all websocket `
-            paper_strategy.py
+          pyinstaller --noconfirm --onefile --windowed --name "BalfundKotakHA" ^
+            --hidden-import customtkinter ^
+            --hidden-import darkdetect ^
+            --hidden-import neo_api_client ^
+            --hidden-import pyotp ^
+            --hidden-import pandas ^
+            --hidden-import numpy ^
+            --hidden-import requests ^
+            --hidden-import websocket ^
+            --hidden-import websocket._app ^
+            --hidden-import config_loader ^
+            --hidden-import kotak_ws_base ^
+            --hidden-import paper_strategy ^
+            --hidden-import option_chain ^
+            --hidden-import candle_engine ^
+            --hidden-import strategy_config ^
+            --collect-all customtkinter ^
+            --collect-all neo_api_client ^
+            --collect-all websocket ^
+            --collect-all pandas ^
+            --collect-all numpy ^
+            app.py
+        shell: cmd
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
-          name: KotakHAStrategy-Windows
-          path: dist/KotakHAStrategy.exe
+          name: BalfundKotakHA-Windows
+          path: dist/BalfundKotakHA.exe
           retention-days: 30
