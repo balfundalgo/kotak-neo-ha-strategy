@@ -1,0 +1,9 @@
+# credentials - never commit
+config.py
+
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+*.csv

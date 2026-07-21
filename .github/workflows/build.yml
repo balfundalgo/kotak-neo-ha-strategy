@@ -1,0 +1,46 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.3.0
+
+      - name: Build EXE
+        run: |
+          pyinstaller --onefile --console --name "KotakHAStrategy" `
+            --hidden-import=neo_api_client `
+            --hidden-import=pyotp `
+            --hidden-import=pandas `
+            --hidden-import=numpy `
+            --hidden-import=requests `
+            --hidden-import=websocket `
+            --hidden-import=websocket._app `
+            --collect-all neo_api_client `
+            --collect-all websocket `
+            paper_strategy.py
+
+      - name: Upload EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: KotakHAStrategy-Windows
+          path: dist/KotakHAStrategy.exe
+          retention-days: 30
