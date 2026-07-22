@@ -70,10 +70,16 @@ class App(ctk.CTk):
         self.running = False
         self.started_at = None
         self._rows = {}
+        self._order_q = queue.Queue()
 
         self._build_header()
         self._build_controls()
         self._build_tabs()
+
+        # route order-router events into a thread-safe queue for the GUI
+        import order_router
+        order_router.on_order(lambda o: self._order_q.put(o))
+        self._apply_mode_style("PAPER")
 
         self.after(300, self._pump)
 
@@ -92,20 +98,66 @@ class App(ctk.CTk):
 
         right = ctk.CTkFrame(bar, fg_color="transparent")
         right.pack(side="right", padx=22)
-        self.lbl_mode = ctk.CTkLabel(right, text="PAPER TRADING",
-                                     font=("Helvetica", 13, "bold"),
-                                     text_color="#ffffff", fg_color="#0f3fa8",
-                                     corner_radius=6, width=140, height=30)
-        self.lbl_mode.pack(pady=(6, 2))
+        self.mode_switch = ctk.CTkSegmentedButton(
+            right, values=["PAPER", "LIVE"],
+            command=self._on_mode_change,
+            selected_color="#0f3fa8", selected_hover_color="#0f3fa8",
+            font=("Helvetica", 12, "bold"), width=150, height=30)
+        self.mode_switch.set("PAPER")
+        self.mode_switch.pack(pady=(6, 2))
         self.lbl_clock = ctk.CTkLabel(right, text="--:--:--",
                                       font=("Helvetica", 12),
                                       text_color="#c7d7f7")
         self.lbl_clock.pack()
 
+    def _on_mode_change(self, value):
+        import order_router
+        if value == "LIVE":
+            if not self._confirm_live():
+                self.mode_switch.set("PAPER")
+                order_router.set_mode("PAPER")
+                self._apply_mode_style("PAPER")
+                return
+            order_router.set_mode("LIVE")
+            self._apply_mode_style("LIVE")
+            self.log("[MODE] LIVE armed - orders will be routed to the broker "
+                     "if the transmit line is enabled in order_router.py")
+        else:
+            order_router.set_mode("PAPER")
+            self._apply_mode_style("PAPER")
+            self.log("[MODE] PAPER - no orders are sent to the broker")
+
+    def _confirm_live(self):
+        """Type-to-confirm gate before arming LIVE."""
+        dlg = ctk.CTkInputDialog(
+            text="LIVE mode routes real orders to your Kotak account.\n"
+                 "Type LIVE (capitals) to confirm, or Cancel to stay on paper.",
+            title="Arm LIVE trading")
+        return (dlg.get_input() or "").strip() == "LIVE"
+
+    def _apply_mode_style(self, mode):
+        if mode == "LIVE":
+            self.configure(fg_color="#2a0d0d")
+            self.mode_switch.configure(selected_color=CLR_RED,
+                                       selected_hover_color="#b91c1c")
+            self.lbl_mode_banner.configure(
+                text="●  LIVE - orders route to broker", text_color=CLR_RED)
+        else:
+            self.configure(fg_color=CLR_BG)
+            self.mode_switch.configure(selected_color="#0f3fa8",
+                                       selected_hover_color="#0f3fa8")
+            self.lbl_mode_banner.configure(
+                text="●  PAPER - simulated fills only", text_color=CLR_GREEN)
+
     def _build_controls(self):
         f = ctk.CTkFrame(self, fg_color=CLR_PANEL, corner_radius=10,
                          border_width=1, border_color=CLR_BORDER)
         f.pack(fill="x", padx=16, pady=(14, 8))
+
+        self.lbl_mode_banner = ctk.CTkLabel(
+            f, text="●  PAPER - simulated fills only",
+            font=("Helvetica", 12, "bold"), text_color=CLR_GREEN)
+        self.lbl_mode_banner.pack(side="right", padx=16)
 
         self.btn_start = ctk.CTkButton(f, text="START", width=130, height=38,
                                        font=("Helvetica", 14, "bold"),
@@ -147,11 +199,14 @@ class App(ctk.CTk):
                                    segmented_button_selected_color=CLR_HEADER,
                                    corner_radius=10)
         self.tabs.pack(fill="both", expand=True, padx=16, pady=(6, 16))
-        for t in ("Credentials", "Positions", "Log", "Settings"):
+        for t in ("Credentials", "Scripts", "Positions", "Orders",
+                  "Log", "Settings"):
             self.tabs.add(t)
 
         self._build_credentials(self.tabs.tab("Credentials"))
+        self._build_scripts(self.tabs.tab("Scripts"))
         self._build_positions(self.tabs.tab("Positions"))
+        self._build_orders(self.tabs.tab("Orders"))
         self._build_log(self.tabs.tab("Log"))
         self._build_settings(self.tabs.tab("Settings"))
 
@@ -279,10 +334,132 @@ class App(ctk.CTk):
         self.lbl_empty = ctk.CTkLabel(
             self.rows_frame,
             text="\n\nNot started.\n\n"
-                 "Press START before 09:00 so the MCX session is captured.\n"
-                 "Strikes lock automatically at 09:00 (MCX) and 09:15 (NSE/BSE).",
+                 "Start any time. Each script takes its reference from the first\n"
+                 "complete 1-minute candle after START (or the session-open\n"
+                 "candle if you start before the open), then locks ATM from it.",
             font=("Helvetica", 13), text_color=CLR_MUTED, justify="center")
         self.lbl_empty.pack(pady=40)
+
+    def _build_scripts(self, parent):
+        import strategy_config as sc
+
+        ctk.CTkLabel(parent, text="Per-script controls",
+                     font=("Helvetica", 15, "bold"), text_color=CLR_TEXT).pack(
+            anchor="w", padx=20, pady=(16, 2))
+        ctk.CTkLabel(parent,
+                     text="Toggle each side on/off and set a take-profit in "
+                          "premium points. Target 0 = no take-profit (reversal "
+                          "only). Applied when you press START.",
+                     font=("Helvetica", 11), text_color=CLR_MUTED,
+                     justify="left").pack(anchor="w", padx=20, pady=(0, 12))
+
+        head = ctk.CTkFrame(parent, fg_color=CLR_CARD, corner_radius=8)
+        head.pack(fill="x", padx=16, pady=(0, 4))
+        for txt, w in [("SCRIPT", 160), ("CE", 90), ("PE", 90),
+                       ("TARGET (pts)", 160)]:
+            ctk.CTkLabel(head, text=txt, width=w, font=("Helvetica", 11, "bold"),
+                         text_color=CLR_MUTED, anchor="w").pack(
+                side="left", padx=10, pady=8)
+
+        self.script_widgets = {}
+        for u in ("NIFTY", "SENSEX", "CRUDEOILM"):
+            cfg = sc.SCRIPT_CONFIG.get(u, {"CE": True, "PE": True,
+                                           "target_points": 0})
+            row = ctk.CTkFrame(parent, fg_color=CLR_PANEL, corner_radius=8,
+                               border_width=1, border_color=CLR_BORDER)
+            row.pack(fill="x", padx=16, pady=3)
+
+            ctk.CTkLabel(row, text=u, width=160, font=("Helvetica", 13, "bold"),
+                         text_color=CLR_TEXT, anchor="w").pack(
+                side="left", padx=10, pady=10)
+
+            ce = ctk.CTkSwitch(row, text="", width=90,
+                               progress_color=CLR_GREEN)
+            (ce.select if cfg.get("CE", True) else ce.deselect)()
+            ce.pack(side="left", padx=10)
+
+            pe = ctk.CTkSwitch(row, text="", width=90,
+                               progress_color=CLR_GREEN)
+            (pe.select if cfg.get("PE", True) else pe.deselect)()
+            pe.pack(side="left", padx=10)
+
+            tgt = ctk.CTkEntry(row, width=140, height=32)
+            tgt.insert(0, str(cfg.get("target_points", 0) or 0))
+            tgt.pack(side="left", padx=10)
+
+            self.script_widgets[u] = {"CE": ce, "PE": pe, "target": tgt}
+
+        ctk.CTkLabel(parent,
+                     text="Live per-side switches also appear on the Positions "
+                          "tab once trading starts; turning one off there exits "
+                          "that leg immediately at LTP.",
+                     font=("Helvetica", 11), text_color=CLR_MUTED,
+                     justify="left").pack(anchor="w", padx=20, pady=(14, 6))
+
+    def _collect_script_config(self):
+        """Read the Scripts tab into a SCRIPT_CONFIG dict."""
+        out = {}
+        for u, w in self.script_widgets.items():
+            try:
+                t = float(w["target"].get())
+            except ValueError:
+                t = 0
+            out[u] = {"CE": bool(w["CE"].get()), "PE": bool(w["PE"].get()),
+                      "target_points": t}
+        return out
+
+    ORDER_COLS = [("time", 90), ("mode", 70), ("action", 60), ("qty", 60),
+                  ("instrument", 240), ("product", 70), ("status", 90),
+                  ("order id", 130), ("message", 260)]
+
+    def _build_orders(self, parent):
+        bar = ctk.CTkFrame(parent, fg_color="transparent")
+        bar.pack(fill="x", padx=12, pady=(10, 2))
+        ctk.CTkLabel(bar, text="Order audit", font=("Helvetica", 14, "bold"),
+                     text_color=CLR_TEXT).pack(side="left")
+        ctk.CTkLabel(bar, text="Every routed order. In PAPER nothing is sent; "
+                               "in LIVE the assembled Kotak payload is "
+                               "transmitted (if the transmit line is enabled).",
+                     font=("Helvetica", 11), text_color=CLR_MUTED).pack(
+            side="left", padx=12)
+
+        head = ctk.CTkFrame(parent, fg_color=CLR_CARD, corner_radius=8, height=34)
+        head.pack(fill="x", padx=12, pady=(4, 2))
+        head.pack_propagate(False)
+        for name, w in self.ORDER_COLS:
+            ctk.CTkLabel(head, text=name.upper(), width=w,
+                         font=("Helvetica", 10, "bold"), text_color=CLR_MUTED,
+                         anchor="w").pack(side="left", padx=4)
+
+        self.orders_frame = ctk.CTkScrollableFrame(parent, fg_color=CLR_PANEL)
+        self.orders_frame.pack(fill="both", expand=True, padx=12, pady=(0, 10))
+        self._order_rows = []
+
+    def _add_order_row(self, o):
+        if o.get("__update__"):
+            return
+        row = ctk.CTkFrame(self.orders_frame, fg_color=CLR_CARD,
+                           corner_radius=6, height=32)
+        row.pack(fill="x", pady=2)
+        row.pack_propagate(False)
+        st = o.get("status", "")
+        st_col = (CLR_GREEN if st in ("PAPER", "SENT", "COMPLETE", "TRADED")
+                  else CLR_RED if st in ("ERROR", "REJECTED", "CANCELLED")
+                  else CLR_AMBER)
+        vals = {
+            "time": f"{o['time']:%H:%M:%S}", "mode": o["mode"],
+            "action": o["action"], "qty": str(o["qty"]),
+            "instrument": o["symbol"], "product": o["product"],
+            "status": st, "order id": str(o.get("broker_order_id") or "-"),
+            "message": (o.get("message") or "")[:60],
+        }
+        for name, w in self.ORDER_COLS:
+            col = (CLR_GREEN if name == "action" and o["action"] == "BUY"
+                   else CLR_RED if name == "action" else
+                   st_col if name == "status" else CLR_TEXT)
+            ctk.CTkLabel(row, text=vals[name], width=w, font=("Menlo", 11),
+                         text_color=col, anchor="w").pack(side="left", padx=4)
+        self._order_rows.append(row)
 
     def _build_log(self, parent):
         self.txt = ctk.CTkTextbox(parent, fg_color="#0f172a",
@@ -321,17 +498,19 @@ class App(ctk.CTk):
 
         rules = (
             "Rules\n"
-            "  • Reference = Heikin Ashi CLOSE of the first 1-minute candle\n"
-            "      09:15  NIFTY (nse_fo) and SENSEX (bse_fo)\n"
-            "      09:00  CRUDEOILM (mcx_fo)\n"
-            "  • ATM strike locked once that first candle completes, fixed for the day\n"
+            "  • Reference = Heikin Ashi CLOSE of the first COMPLETE 1-minute\n"
+            "    candle at or after the later of (START, session open):\n"
+            "      start before open -> session-open candle (09:00 MCX, 09:15 NSE/BSE)\n"
+            "      start after open  -> first full candle after you start\n"
+            "  • ATM is locked from the spot/future close of that same candle\n"
             "  • Every completed candle after that:\n"
             "        HA close ABOVE reference  ->  BUY that strike\n"
             "        HA close BELOW reference  ->  SELL that strike\n"
-            "        HA close EQUAL reference  ->  no action\n"
             "  • Stop and reverse: 1 lot on first entry, 2 lots on every reversal\n"
-            "  • CE and PE trade independently, no cap on trades\n"
-            "  • Signals use the Heikin Ashi close, fills use the raw candle close"
+            "  • Per-script target (Scripts tab): premium-point take-profit that\n"
+            "    exits at LTP then re-enters on the next signal\n"
+            "  • CE and PE trade independently; each side can be toggled off\n"
+            "  • PAPER routes nothing; LIVE transmits the assembled Kotak order"
         )
         ctk.CTkLabel(parent, text=rules, font=("Menlo", 11),
                      text_color=CLR_TEXT, justify="left").pack(
@@ -371,6 +550,10 @@ class App(ctk.CTk):
         except ValueError:
             pass
         sc.FILL_PRICE = self.opt_fill.get()
+        sc.SCRIPT_CONFIG.update(self._collect_script_config())
+        for u, c in sc.SCRIPT_CONFIG.items():
+            self.log(f"[CFG ] {u}: CE={c['CE']} PE={c['PE']} "
+                     f"target={c['target_points']:g}pt")
 
         self.runner = threading.Thread(target=self._run, daemon=True)
         self.runner.start()
@@ -401,7 +584,18 @@ class App(ctk.CTk):
             self.client = client
             client.on_message = ps.on_message
             ps.POOL.on_candle_close(ps.on_candle)
-            print("[GUI ] authenticated")
+
+            import order_router
+            order_router.set_client(client)
+            print(f"[GUI ] authenticated | mode {order_router.get_mode()}")
+
+            # ---- LIVE order-feed (fill / reject status) --------------------
+            # To receive broker order updates in the Orders panel, subscribe to
+            # the Kotak order feed and route messages to handle_order_update.
+            # Uncomment the line matching your SDK build:
+            # client.subscribe_to_orderfeed()
+            # and in kotak_ws_base.on_message, forward order-feed messages:
+            #     order_router.handle_order_update(msg)
 
             masters = {}
             for seg in sorted({u["fo_segment"] for u in UNDERLYINGS.values()}):
@@ -441,9 +635,8 @@ class App(ctk.CTk):
             bands, band_subs = {}, []
             for name, cfg in UNDERLYINGS.items():
                 sname = spot_names.get(name)
-                est = ps.PREV_CLOSE.get(sname)
-                if est is None:
-                    est = (ps.POOL.snapshot().get(sname) or {}).get("ltp")
+                snap = ps.POOL.snapshot().get(sname) or {}
+                est = snap.get("ltp") or ps.PREV_CLOSE.get(sname)
                 if est is None:
                     print(f"[WARN] {name}: no reference price, skipped")
                     continue
@@ -463,19 +656,19 @@ class App(ctk.CTk):
 
             ps.POOL.start_roller(interval=1.0)
 
-            today = datetime.now(IST).date()
+            algo_ready = datetime.now(IST)
+            today = algo_ready.date()
             pending = {}
             for name, cfg in UNDERLYINGS.items():
                 if name not in bands:
                     continue
-                ref_b = datetime.combine(today, SESSION_OPEN[cfg["fo_segment"]],
-                                         tzinfo=IST)
-                pending[name] = {
-                    "cfg": cfg, "ref_bucket": ref_b,
-                    "lock_at": ref_b + timedelta(minutes=1,
-                                                 seconds=LOCK_DELAY_SEC)}
-                print(f"[PLAN] {name}: reference {ref_b:%H:%M}, "
-                      f"lock {pending[name]['lock_at']:%H:%M:%S}")
+                ref_b, lock_at, late = ps.plan_reference(
+                    name, cfg, algo_ready, today)
+                pending[name] = {"cfg": cfg, "ref_bucket": ref_b,
+                                 "lock_at": lock_at}
+                tag = "LATE-START" if late else "session-open"
+                print(f"[PLAN] {name}: reference candle {ref_b:%H:%M} ({tag}), "
+                      f"lock {lock_at:%H:%M:%S}")
 
             print("[RUN ] live")
             while not self.stop_evt.is_set():
@@ -518,6 +711,14 @@ class App(ctk.CTk):
         while drained < 200:
             try:
                 self.log(LOG_Q.get_nowait())
+                drained += 1
+            except queue.Empty:
+                break
+
+        drained = 0
+        while drained < 100:
+            try:
+                self._add_order_row(self._order_q.get_nowait())
                 drained += 1
             except queue.Empty:
                 break

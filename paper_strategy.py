@@ -2,28 +2,41 @@
 Paper strategy - first-candle HA reference, stop-and-reverse
 ============================================================
 
-Rules
------
-1. Start before 09:00 (MCX opens first).
-2. Before the bell, subscribe a BAND of strikes around an estimated ATM
-   (estimated from previous close) so first-minute candles exist for
-   whichever strike turns out to be ATM.
-3. At session open + 1 minute:
-       - lock ATM from the spot/futures first-candle close
-       - reference = HA CLOSE of that option's first candle
-       - discard the rest of the band
-   Session open: 09:15 for nse_fo / bse_fo, 09:00 for mcx_fo.
-4. From the next candle onward, on every closed candle:
-       HA close > reference  -> target LONG
-       HA close < reference  -> target SHORT
-       HA close = reference  -> hold
-   Stop-and-reverse: if target != current state, close and open opposite in
-   one action. First entry is 1 lot; every reversal is 2 lots
-   (1 to close + 1 to open). No cap on trades.
-5. CE and PE are fully independent - both can be long, both short, or opposite.
+Reference candle (Rule B, per underlying, independent)
+------------------------------------------------------
+When you press START, each underlying computes
 
-Signals use the Heikin Ashi close. Fills use the RAW candle close, since HA
-is a synthetic price you cannot trade at (see FILL_PRICE in strategy_config).
+    effective start = max( now , that segment's session open )
+
+and takes as its reference the first FULLY-COMPLETE 1-minute candle at or
+after that. So:
+  * start before the open -> reference is the session-open candle
+                             (09:00 mcx_fo, 09:15 nse_fo/bse_fo)
+  * start after the open  -> reference is the first complete candle after
+                             you started (start 10:00:30 -> candle 10:01-10:02)
+Each underlying decides independently. ATM is (re)locked from the spot/future
+close of that same reference candle, so a 10:00 start trades strikes that are
+ATM at 10:00, not at the open.
+
+Trading (unchanged)
+-------------------
+From the candle AFTER the reference, on every closed candle:
+    HA close > reference -> target LONG
+    HA close < reference -> target SHORT
+Stop-and-reverse: first entry 1 lot, each reversal 2 lots. CE and PE are
+independent.
+
+Per-script controls (strategy_config.SCRIPT_CONFIG)
+---------------------------------------------------
+  * Per-side on/off: six switches (NIFTY CE/PE, SENSEX CE/PE, CRUDEOILM CE/PE).
+    A disabled side is never locked and never traded.
+  * Per-script target in premium points: a take-profit that sits ON TOP of the
+    stop-and-reverse. When an open leg's premium moves target_points in your
+    favour it books profit at the live LTP, goes flat, and re-enters on the
+    next signal. Checked live on every tick, not just at candle close.
+
+Signals use the Heikin Ashi close; HA close = (O+H+L+C)/4 is exact from the
+first candle, so no warm-up is needed for this strategy.
 
 PAPER TRADING ONLY - places no orders.
 """
@@ -39,15 +52,15 @@ from option_chain import (
     UNDERLYINGS, load_scrip_master, option_rows,
     near_month_future, MAX_TOTAL_SCRIPS,
 )
-from candle_engine import EnginePool, IST
+from candle_engine import EnginePool, IST, minute_bucket
 from strategy_config import (
     SESSION_OPEN, BAND, UNSUBSCRIBE_BAND_AFTER_LOCK,
-    LOCK_DELAY_SEC, FILL_PRICE, STATUS_EVERY,
+    LOCK_DELAY_SEC, FILL_PRICE, STATUS_EVERY, SCRIPT_CONFIG,
 )
 
 POOL = EnginePool()
 PREV_CLOSE = {}          # name -> previous close from the feed
-LEGS = {}                # symbol -> Leg (only the 6 locked legs)
+LEGS = {}                # symbol -> Leg (only the locked legs)
 _state_lock = threading.RLock()
 
 
@@ -55,14 +68,16 @@ _state_lock = threading.RLock()
 # Position / paper book
 # ---------------------------------------------------------------------------
 class Leg:
-    def __init__(self, symbol, token, segment, underlying, side, strike, lot):
+    def __init__(self, symbol, token, segment, underlying, side, strike, lot,
+                 target_points=None):
         self.symbol = symbol
         self.token = token
         self.segment = segment
         self.underlying = underlying
         self.side = side                # CE / PE
         self.strike = strike
-        self.lot = int(lot)
+        self.lot = int(lot)             # exchange lot size = P&L multiplier
+        self.target_points = target_points  # premium points, or None
 
         self.reference = None
         self.state = "FLAT"             # FLAT / LONG / SHORT
@@ -71,14 +86,18 @@ class Leg:
         self.realized = 0.0
         self.trades = []
         self.last_price = None
+        self.active = True              # per-side live switch (future GUI use)
+        self._skip_bucket = None        # candle we target-exited in; no re-entry
+        self._pos_bucket = None         # candle the current position opened in
 
     # -- paper fills ----------------------------------------------------
     def _open(self, side, px, ts):
         self.state = side
         self.entry_price = px
         self.entry_time = ts
+        self._pos_bucket = minute_bucket(ts)   # candle this position opened in
 
-    def _close(self, px, ts):
+    def _close(self, px, ts, reason=""):
         if self.state == "LONG":
             pnl = (px - self.entry_price) * self.lot
         elif self.state == "SHORT":
@@ -88,8 +107,11 @@ class Leg:
         self.realized += pnl
         self.trades.append({
             "side": self.state, "entry": self.entry_price, "exit": px,
-            "in": self.entry_time, "out": ts, "pnl": pnl,
+            "in": self.entry_time, "out": ts, "pnl": pnl, "reason": reason,
         })
+        self.state = "FLAT"
+        self.entry_price = None
+        self.entry_time = None
         return pnl
 
     def unrealized(self, px=None):
@@ -100,9 +122,46 @@ class Leg:
             return (px - self.entry_price) * self.lot
         return (self.entry_price - px) * self.lot
 
-    # -- signal ---------------------------------------------------------
+    # -- order routing (PAPER/LIVE via order_router) --------------------
+    def _route(self, action, qty, price, reason):
+        try:
+            import order_router
+            order_router.execute_order(
+                symbol=self.symbol, exchange_segment=self.segment,
+                action=action, quantity=qty, price=price,
+                order_type="MKT", reason=reason)
+        except Exception as e:
+            print(f"[ORDER] route error on {self.symbol}: {e}")
+
+    # -- live tick: update LTP and check the profit target --------------
+    def on_price(self, px):
+        try:
+            px = float(px)
+        except (TypeError, ValueError):
+            return
+        self.last_price = px
+
+        if (self.state == "FLAT" or not self.active
+                or not self.target_points or self.target_points <= 0):
+            return
+
+        move = (px - self.entry_price) if self.state == "LONG" \
+            else (self.entry_price - px)
+        if move >= self.target_points:
+            ts = datetime.now(IST)
+            side = self.state
+            # skip re-entry in the candle this position is currently in
+            self._skip_bucket = minute_bucket(ts)
+            close_act = "SELL" if side == "LONG" else "BUY"
+            self._route(close_act, self.lot, px, "TARGET")
+            pnl = self._close(px, ts, reason="TARGET")
+            print(f"{ts:%H:%M:%S}  {self.symbol:<26} TARGET {side} "
+                  f"+{move:,.2f}pt >= {self.target_points:g}  exit @ "
+                  f"{px:>9,.2f}  booked {pnl:>+10,.2f}")
+
+    # -- candle close: stop-and-reverse signal --------------------------
     def evaluate(self, candle):
-        if self.reference is None:
+        if self.reference is None or not self.active:
             return
 
         ha = candle["ha_close"]
@@ -115,15 +174,17 @@ class Leg:
         elif ha < self.reference:
             target = "SHORT"
         else:
-            print(f"{ts:%H:%M}  {self.symbol:<26} HA {ha:>9,.2f} == ref "
-                  f"{self.reference:>9,.2f}  hold ({self.state})")
             return
 
         if target == self.state:
             return
 
+        # Don't re-enter inside the same candle a target-exit just fired in.
+        if self.state == "FLAT" and candle["bucket"] == self._skip_bucket:
+            return
+
         prev = self.state
-        pnl = self._close(fill, ts) if prev != "FLAT" else 0.0
+        pnl = self._close(fill, ts, reason="REVERSE") if prev != "FLAT" else 0.0
         self._open(target, fill, ts)
 
         lots = 1 if prev == "FLAT" else 2
@@ -132,9 +193,26 @@ class Leg:
         tag = "ENTRY" if prev == "FLAT" else f"REVERSE {prev}->{target}"
         pnl_s = f" | closed P&L {pnl:>+10,.2f}" if prev != "FLAT" else ""
 
+        self._route(act, qty, fill, tag)
+
         print(f"{ts:%H:%M}  {self.symbol:<26} HA {ha:>9,.2f} vs ref "
-              f"{self.reference:>9,.2f}  {act} {qty:>4} ({lots} lot"
+              f"{self.reference:>9,.2f}  {act} {qty:>5} ({lots} lot"
               f"{'s' if lots > 1 else ''}) @ {fill:>9,.2f}  [{tag}]{pnl_s}")
+
+    # -- live toggle-off: immediate exit at LTP -------------------------
+    def force_close(self, px=None, ts=None):
+        if self.state == "FLAT":
+            return 0.0
+        px = px if px is not None else self.last_price
+        if px is None:
+            return 0.0
+        ts = ts or datetime.now(IST)
+        close_act = "SELL" if self.state == "LONG" else "BUY"
+        self._route(close_act, self.lot, px, "TOGGLE-OFF")
+        pnl = self._close(px, ts, reason="TOGGLE-OFF")
+        print(f"{ts:%H:%M:%S}  {self.symbol:<26} TOGGLE-OFF exit @ "
+              f"{px:>9,.2f}  booked {pnl:>+10,.2f}")
+        return pnl
 
 
 # ---------------------------------------------------------------------------
@@ -158,7 +236,6 @@ def on_message(msg):
         if not name:
             continue
 
-        # previous close: 'c' for scrips, 'ic' for indices
         pc = tick.get("c") or tick.get("ic")
         if pc is not None and name not in PREV_CLOSE:
             try:
@@ -169,7 +246,14 @@ def on_message(msg):
         price = tick.get("ltp") or tick.get("iv")
         if price is None:
             continue
+
         POOL.on_tick(name, price)
+
+        # live profit-target check for a traded leg
+        with _state_lock:
+            leg = LEGS.get(name)
+        if leg is not None:
+            leg.on_price(price)
 
 
 def on_candle(name, candle):
@@ -177,6 +261,18 @@ def on_candle(name, candle):
         leg = LEGS.get(name)
     if leg:
         leg.evaluate(candle)
+
+
+def apply_live_toggle(symbol, active):
+    """GUI per-side switch. Turning a leg off exits it immediately at LTP."""
+    with _state_lock:
+        leg = LEGS.get(symbol)
+    if leg is None:
+        return
+    was = leg.active
+    leg.active = bool(active)
+    if was and not leg.active:
+        leg.force_close()
 
 
 # ---------------------------------------------------------------------------
@@ -227,12 +323,35 @@ def build_band(masters, underlying, cfg, estimate):
 
 
 # ---------------------------------------------------------------------------
+# Reference-candle timing (Rule B)
+# ---------------------------------------------------------------------------
+def ceil_minute(dt):
+    """Smallest minute boundary >= dt (equal to dt if already on a boundary)."""
+    b = dt.replace(second=0, microsecond=0)
+    return b if dt == b else b + timedelta(minutes=1)
+
+
+def plan_reference(name, cfg, algo_ready, today):
+    """
+    Decide the reference candle bucket and lock time for one underlying.
+    Returns (ref_bucket, lock_at, late).
+    """
+    open_t = SESSION_OPEN[cfg["fo_segment"]]
+    session_open_dt = datetime.combine(today, open_t, tzinfo=IST)
+    effective = max(algo_ready, session_open_dt)
+    ref_bucket = ceil_minute(effective)
+    late = algo_ready > session_open_dt
+    lock_at = ref_bucket + timedelta(minutes=1, seconds=LOCK_DELAY_SEC)
+    return ref_bucket, lock_at, late
+
+
+# ---------------------------------------------------------------------------
 # Locking
 # ---------------------------------------------------------------------------
 def first_candle(engine, ref_bucket):
     """
-    Candle stamped exactly at the session-open minute. Falls back to the
-    earliest available candle (with a warning) if that one is missing.
+    Candle stamped exactly at ref_bucket. Falls back to the earliest candle
+    after it (with a late flag) if that exact one is missing.
     """
     hist = engine.history(600)
     for c in hist:
@@ -245,7 +364,8 @@ def first_candle(engine, ref_bucket):
 
 
 def lock_underlying(underlying, cfg, band_rows, spot_name, ref_bucket):
-    """Lock ATM and set references. Returns (kept_symbols, dropped_subs)."""
+    """Lock ATM from the reference candle and set references. Returns
+    (kept_symbols, dropped_subs)."""
     spot_engine = POOL.engines.get(spot_name)
     if spot_engine is None:
         print(f"[LOCK] {underlying}: no spot engine, skipping")
@@ -253,11 +373,12 @@ def lock_underlying(underlying, cfg, band_rows, spot_name, ref_bucket):
 
     spot_c, late = first_candle(spot_engine, ref_bucket)
     if spot_c is None:
-        print(f"[LOCK] {underlying}: no spot candle yet, skipping")
+        print(f"[LOCK] {underlying}: no spot candle at {ref_bucket:%H:%M} yet, "
+              f"skipping")
         return [], []
     if late:
-        print(f"[LOCK] {underlying}: spot reference candle missing at "
-              f"{ref_bucket:%H:%M}, using {spot_c['bucket']:%H:%M}")
+        print(f"[LOCK] {underlying}: exact {ref_bucket:%H:%M} spot candle "
+              f"missing, using {spot_c['bucket']:%H:%M}")
 
     spot_px = spot_c["close"]
     strikes = sorted({r["strike"] for r in band_rows})
@@ -265,40 +386,51 @@ def lock_underlying(underlying, cfg, band_rows, spot_name, ref_bucket):
         return [], []
     atm = min(strikes, key=lambda s: abs(s - spot_px))
 
-    print(f"\n[LOCK] {underlying}: spot first candle close {spot_px:,.2f} "
-          f"-> ATM {atm:,.0f}")
+    scfg = SCRIPT_CONFIG.get(underlying, {})
+    target = scfg.get("target_points") or 0
+    target = target if target > 0 else None
+
+    print(f"\n[LOCK] {underlying}: reference candle {ref_bucket:%H:%M} "
+          f"spot close {spot_px:,.2f} -> ATM {atm:,.0f}"
+          + (f" | target {target:g}pt" if target else " | no target"))
 
     kept, dropped = [], []
     for r in band_rows:
-        if r["strike"] != atm:
+        keep = (r["strike"] == atm) and bool(scfg.get(r["side"], True))
+        if not keep:
             dropped.append({"instrument_token": r["token"],
                             "exchange_segment": r["segment"]})
+            if r["strike"] == atm and not scfg.get(r["side"], True):
+                print(f"       {r['side']} {r['strike']:,.0f}: disabled in "
+                      f"config, not traded")
             continue
 
         eng = POOL.engines.get(r["symbol"])
         if eng is None:
-            print(f"       {r['side']}: {r['symbol']} - no candles, skipped")
+            print(f"       {r['side']} {r['strike']:,.0f}: {r['symbol']} "
+                  f"- no candles, skipped")
             continue
 
-        c, late = first_candle(eng, ref_bucket)
+        c, clate = first_candle(eng, ref_bucket)
         if c is None:
-            print(f"       {r['side']}: {r['symbol']} - no candle, skipped")
+            print(f"       {r['side']} {r['strike']:,.0f}: {r['symbol']} "
+                  f"- no candle, skipped")
             continue
-        if late:
+        if clate:
             print(f"       [WARN] {r['symbol']}: no ticks at "
-                  f"{ref_bucket:%H:%M}, reference taken from "
-                  f"{c['bucket']:%H:%M}")
+                  f"{ref_bucket:%H:%M}, reference from {c['bucket']:%H:%M}")
 
         leg = Leg(r["symbol"], r["token"], r["segment"], underlying,
-                  r["side"], r["strike"], r["lot"])
+                  r["side"], r["strike"], r["lot"], target_points=target)
         leg.reference = c["ha_close"]
         with _state_lock:
             LEGS[r["symbol"]] = leg
         kept.append(r["symbol"])
 
-        print(f"       {r['side']}: {r['symbol']:<26} ref HA close "
-              f"{leg.reference:>9,.2f}  (O {c['open']:,.2f} H {c['high']:,.2f} "
-              f"L {c['low']:,.2f} C {c['close']:,.2f})  lot {leg.lot}")
+        print(f"       {r['side']} {r['strike']:,.0f}: {r['symbol']:<26} "
+              f"ref HA close {leg.reference:>9,.2f}  (O {c['open']:,.2f} "
+              f"H {c['high']:,.2f} L {c['low']:,.2f} C {c['close']:,.2f})  "
+              f"lot {leg.lot}")
 
     return kept, dropped
 
@@ -311,24 +443,27 @@ def print_status():
         legs = list(LEGS.values())
     if not legs:
         return
-    print(f"\n{'=' * 108}")
+    print(f"\n{'=' * 112}")
     print(f"{datetime.now(IST):%H:%M:%S}  PAPER BOOK")
     print(f"{'instrument':<26}{'ref':>10}{'last':>10}{'state':>7}"
-          f"{'entry':>10}{'qty':>7}{'realized':>12}{'unreal':>12}{'trades':>8}")
-    print("-" * 108)
+          f"{'entry':>10}{'tgt':>7}{'qty':>7}{'realized':>12}"
+          f"{'unreal':>12}{'trades':>8}")
+    print("-" * 112)
     tot_r = tot_u = 0.0
     for lg in sorted(legs, key=lambda x: (x.underlying, x.side)):
         u = lg.unrealized()
         tot_r += lg.realized
         tot_u += u
+        tgt = f"{lg.target_points:g}" if lg.target_points else "-"
         print(f"{lg.symbol:<26}{lg.reference or 0:>10,.2f}"
               f"{lg.last_price or 0:>10,.2f}{lg.state:>7}"
-              f"{lg.entry_price or 0:>10,.2f}{lg.lot if lg.state != 'FLAT' else 0:>7}"
+              f"{lg.entry_price or 0:>10,.2f}{tgt:>7}"
+              f"{lg.lot if lg.state != 'FLAT' else 0:>7}"
               f"{lg.realized:>+12,.2f}{u:>+12,.2f}{len(lg.trades):>8}")
-    print("-" * 108)
-    print(f"{'TOTAL':<70}{tot_r:>+12,.2f}{tot_u:>+12,.2f}"
+    print("-" * 112)
+    print(f"{'TOTAL':<76}{tot_r:>+12,.2f}{tot_u:>+12,.2f}"
           f"{'  net ' + format(tot_r + tot_u, '+,.2f'):>20}")
-    print(f"{'=' * 108}\n")
+    print(f"{'=' * 112}\n")
 
 
 # ---------------------------------------------------------------------------
@@ -366,7 +501,7 @@ def main():
     if fut_subs:
         client.subscribe(instrument_tokens=fut_subs)
 
-    print("\n[PREV] waiting for previous-close values...")
+    print("\n[PREV] waiting for spot prices / previous close...")
     deadline = _time.time() + 30
     while _time.time() < deadline:
         if all(spot_names[u] in PREV_CLOSE or spot_names[u] in POOL.engines
@@ -374,17 +509,15 @@ def main():
             break
         _time.sleep(0.5)
 
-    # ---- band subscriptions -------------------------------------------
+    # ---- band subscriptions (centre on live LTP, else previous close) --
     print()
     bands, band_subs = {}, []
     for name, cfg in UNDERLYINGS.items():
         sname = spot_names.get(name)
-        est = PREV_CLOSE.get(sname)
+        snap = POOL.snapshot().get(sname) or {}
+        est = snap.get("ltp") or PREV_CLOSE.get(sname)
         if est is None:
-            snap = POOL.snapshot().get(sname) or {}
-            est = snap.get("ltp")
-        if est is None:
-            print(f"[WARN] {name}: no previous close or LTP, cannot build band")
+            print(f"[WARN] {name}: no LTP or previous close, cannot build band")
             continue
 
         rows, _ = build_band(masters, name, cfg, est)
@@ -404,21 +537,21 @@ def main():
 
     POOL.start_roller(interval=1.0)
 
-    # ---- wait for each session, then lock ------------------------------
-    today = datetime.now(IST).date()
+    # ---- plan each underlying's reference candle (Rule B) --------------
+    algo_ready = datetime.now(IST)
+    today = algo_ready.date()
     pending = {}
     for name, cfg in UNDERLYINGS.items():
         if name not in bands:
             continue
-        open_t = SESSION_OPEN[cfg["fo_segment"]]
-        ref_bucket = datetime.combine(today, open_t, tzinfo=IST)
+        ref_bucket, lock_at, late = plan_reference(name, cfg, algo_ready, today)
         pending[name] = {"cfg": cfg, "ref_bucket": ref_bucket,
-                         "lock_at": ref_bucket + timedelta(minutes=1,
-                                                           seconds=LOCK_DELAY_SEC)}
-        print(f"[PLAN] {name}: reference candle {ref_bucket:%H:%M}, "
-              f"lock at {pending[name]['lock_at']:%H:%M:%S}")
+                         "lock_at": lock_at}
+        tag = "LATE-START" if late else "session-open"
+        print(f"[PLAN] {name}: reference candle {ref_bucket:%H:%M} ({tag}), "
+              f"lock at {lock_at:%H:%M:%S}")
 
-    print("\n[RUN ] waiting for session opens... Ctrl-C to stop\n")
+    print("\n[RUN ] waiting for reference candles... Ctrl-C to stop\n")
     last_status = 0.0
     try:
         while True:
@@ -437,7 +570,7 @@ def main():
                                     instrument_tokens=dropped[i:i + 100])
                             except Exception as e:
                                 print(f"[LOCK] unsubscribe error: {e}")
-                        print(f"       dropped {len(dropped)} band legs, "
+                        print(f"       dropped {len(dropped)} legs, "
                               f"trading {len(kept)}")
 
             if _time.time() - last_status > STATUS_EVERY:
@@ -456,7 +589,7 @@ def main():
                     print(f"  {lg.symbol:<26} {t['side']:<5} "
                           f"{t['in']:%H:%M} {t['entry']:>9,.2f} -> "
                           f"{t['out']:%H:%M} {t['exit']:>9,.2f}  "
-                          f"{t['pnl']:>+10,.2f}")
+                          f"{t['pnl']:>+10,.2f}  [{t.get('reason','')}]")
         try:
             client.logout()
         except Exception:

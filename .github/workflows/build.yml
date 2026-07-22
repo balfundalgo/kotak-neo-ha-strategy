@@ -40,6 +40,7 @@ jobs:
             --hidden-import option_chain ^
             --hidden-import candle_engine ^
             --hidden-import strategy_config ^
+            --hidden-import order_router ^
             --collect-all customtkinter ^
             --collect-all neo_api_client ^
             --collect-all websocket ^
