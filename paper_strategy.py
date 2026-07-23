@@ -58,6 +58,8 @@ from strategy_config import (
     LOCK_DELAY_SEC, FILL_PRICE, STATUS_EVERY, SCRIPT_CONFIG,
 )
 
+REJECT_RETRY_SEC = 5      # back-off before retrying after a broker rejection
+
 POOL = EnginePool()
 PREV_CLOSE = {}          # name -> previous close from the feed
 LEGS = {}                # symbol -> Leg (only the locked legs)
@@ -68,15 +70,16 @@ _state_lock = threading.RLock()
 # Position / paper book
 # ---------------------------------------------------------------------------
 class Leg:
-    def __init__(self, symbol, token, segment, underlying, side, strike, lot,
-                 target_points=None):
+    def __init__(self, symbol, token, segment, underlying, side, strike,
+                 lot_qty, num_lots=1, target_points=None):
         self.symbol = symbol
         self.token = token
         self.segment = segment
         self.underlying = underlying
         self.side = side                # CE / PE
         self.strike = strike
-        self.lot = int(lot)             # exchange lot size = P&L multiplier
+        self.lot_qty = int(lot_qty)         # exchange lot size (NIFTY 65 etc)
+        self.num_lots = max(1, int(num_lots))   # user-selected lots
         self.target_points = target_points  # premium points, or None
 
         self.reference = None
@@ -89,6 +92,17 @@ class Leg:
         self.active = True              # per-side live switch (future GUI use)
         self._skip_bucket = None        # candle we target-exited in; no re-entry
         self._pos_bucket = None         # candle the current position opened in
+        self._last_reject = 0.0         # throttle retries after a rejection
+
+    @property
+    def qty(self):
+        """Order / P&L quantity = exchange lot size x number of lots."""
+        return self.lot_qty * self.num_lots
+
+    @property
+    def lot(self):
+        """Backward-compatible alias used by the GUI/status table."""
+        return self.qty
 
     # -- paper fills ----------------------------------------------------
     def _open(self, side, px, ts):
@@ -99,9 +113,9 @@ class Leg:
 
     def _close(self, px, ts, reason=""):
         if self.state == "LONG":
-            pnl = (px - self.entry_price) * self.lot
+            pnl = (px - self.entry_price) * self.qty
         elif self.state == "SHORT":
-            pnl = (self.entry_price - px) * self.lot
+            pnl = (self.entry_price - px) * self.qty
         else:
             return 0.0
         self.realized += pnl
@@ -119,19 +133,31 @@ class Leg:
         if px is None or self.state == "FLAT":
             return 0.0
         if self.state == "LONG":
-            return (px - self.entry_price) * self.lot
-        return (self.entry_price - px) * self.lot
+            return (px - self.entry_price) * self.qty
+        return (self.entry_price - px) * self.qty
 
     # -- order routing (PAPER/LIVE via order_router) --------------------
     def _route(self, action, qty, price, reason):
+        """Send the order. Returns True ONLY if the broker accepted it.
+        The caller must not change the leg's position when this is False."""
         try:
             import order_router
-            order_router.execute_order(
+            o = order_router.execute_order(
                 symbol=self.symbol, exchange_segment=self.segment,
                 action=action, quantity=qty, price=price,
                 order_type="MKT", reason=reason)
+            ok = order_router.was_accepted(o)
+            if not ok:
+                self._last_reject = _time.time()
+            return ok
         except Exception as e:
             print(f"[ORDER] route error on {self.symbol}: {e}")
+            self._last_reject = _time.time()
+            return False
+
+    def _throttled(self, seconds=REJECT_RETRY_SEC):
+        """True if we very recently had a rejection (avoid order spam)."""
+        return (_time.time() - self._last_reject) < seconds
 
     # -- live tick: update LTP and check the profit target --------------
     def on_price(self, px):
@@ -148,12 +174,19 @@ class Leg:
         move = (px - self.entry_price) if self.state == "LONG" \
             else (self.entry_price - px)
         if move >= self.target_points:
+            if self._throttled():
+                return                      # a reject just happened; back off
             ts = datetime.now(IST)
             side = self.state
+            close_act = "SELL" if side == "LONG" else "BUY"
+
+            if not self._route(close_act, self.qty, px, "TARGET"):
+                print(f"{ts:%H:%M:%S}  {self.symbol:<26} TARGET exit REJECTED "
+                      f"- position still {side}, will retry")
+                return                      # position UNCHANGED
+
             # skip re-entry in the candle this position is currently in
             self._skip_bucket = minute_bucket(ts)
-            close_act = "SELL" if side == "LONG" else "BUY"
-            self._route(close_act, self.lot, px, "TARGET")
             pnl = self._close(px, ts, reason="TARGET")
             print(f"{ts:%H:%M:%S}  {self.symbol:<26} TARGET {side} "
                   f"+{move:,.2f}pt >= {self.target_points:g}  exit @ "
@@ -184,16 +217,21 @@ class Leg:
             return
 
         prev = self.state
-        pnl = self._close(fill, ts, reason="REVERSE") if prev != "FLAT" else 0.0
-        self._open(target, fill, ts)
-
-        lots = 1 if prev == "FLAT" else 2
-        qty = self.lot * lots
+        lots = self.num_lots if prev == "FLAT" else self.num_lots * 2
+        qty = self.lot_qty * lots
         act = "BUY" if target == "LONG" else "SELL"
         tag = "ENTRY" if prev == "FLAT" else f"REVERSE {prev}->{target}"
-        pnl_s = f" | closed P&L {pnl:>+10,.2f}" if prev != "FLAT" else ""
 
-        self._route(act, qty, fill, tag)
+        # Route FIRST. If the broker rejects, leave the position untouched so
+        # the book can never drift away from the real account.
+        if not self._route(act, qty, fill, tag):
+            print(f"{ts:%H:%M}  {self.symbol:<26} {tag} REJECTED "
+                  f"- position unchanged ({prev})")
+            return
+
+        pnl = self._close(fill, ts, reason="REVERSE") if prev != "FLAT" else 0.0
+        self._open(target, fill, ts)
+        pnl_s = f" | closed P&L {pnl:>+10,.2f}" if prev != "FLAT" else ""
 
         print(f"{ts:%H:%M}  {self.symbol:<26} HA {ha:>9,.2f} vs ref "
               f"{self.reference:>9,.2f}  {act} {qty:>5} ({lots} lot"
@@ -208,7 +246,10 @@ class Leg:
             return 0.0
         ts = ts or datetime.now(IST)
         close_act = "SELL" if self.state == "LONG" else "BUY"
-        self._route(close_act, self.lot, px, "TOGGLE-OFF")
+        if not self._route(close_act, self.qty, px, "TOGGLE-OFF"):
+            print(f"{ts:%H:%M:%S}  {self.symbol:<26} TOGGLE-OFF exit REJECTED "
+                  f"- position still {self.state}, square off manually")
+            return 0.0
         pnl = self._close(px, ts, reason="TOGGLE-OFF")
         print(f"{ts:%H:%M:%S}  {self.symbol:<26} TOGGLE-OFF exit @ "
               f"{px:>9,.2f}  booked {pnl:>+10,.2f}")
@@ -261,6 +302,20 @@ def on_candle(name, candle):
         leg = LEGS.get(name)
     if leg:
         leg.evaluate(candle)
+
+
+def reset_state():
+    """Full teardown between runs: clears legs, prices and candle engines.
+    Without this, legs from a previous run keep receiving ticks and firing
+    orders after STOP."""
+    with _state_lock:
+        LEGS.clear()
+    PREV_CLOSE.clear()
+    try:
+        POOL.reset()
+    except Exception as e:
+        print(f"[RESET] pool: {e}")
+    print("[RESET] strategy state cleared")
 
 
 def apply_live_toggle(symbol, active):
@@ -389,9 +444,14 @@ def lock_underlying(underlying, cfg, band_rows, spot_name, ref_bucket):
     scfg = SCRIPT_CONFIG.get(underlying, {})
     target = scfg.get("target_points") or 0
     target = target if target > 0 else None
+    try:
+        num_lots = max(1, int(scfg.get("lots", 1)))
+    except (TypeError, ValueError):
+        num_lots = 1
 
     print(f"\n[LOCK] {underlying}: reference candle {ref_bucket:%H:%M} "
           f"spot close {spot_px:,.2f} -> ATM {atm:,.0f}"
+          + f" | {num_lots} lot(s)"
           + (f" | target {target:g}pt" if target else " | no target"))
 
     kept, dropped = [], []
@@ -421,7 +481,8 @@ def lock_underlying(underlying, cfg, band_rows, spot_name, ref_bucket):
                   f"{ref_bucket:%H:%M}, reference from {c['bucket']:%H:%M}")
 
         leg = Leg(r["symbol"], r["token"], r["segment"], underlying,
-                  r["side"], r["strike"], r["lot"], target_points=target)
+                  r["side"], r["strike"], r["lot"],
+                  num_lots=num_lots, target_points=target)
         leg.reference = c["ha_close"]
         with _state_lock:
             LEGS[r["symbol"]] = leg
@@ -430,7 +491,7 @@ def lock_underlying(underlying, cfg, band_rows, spot_name, ref_bucket):
         print(f"       {r['side']} {r['strike']:,.0f}: {r['symbol']:<26} "
               f"ref HA close {leg.reference:>9,.2f}  (O {c['open']:,.2f} "
               f"H {c['high']:,.2f} L {c['low']:,.2f} C {c['close']:,.2f})  "
-              f"lot {leg.lot}")
+              f"{leg.num_lots} x {leg.lot_qty} = qty {leg.qty}")
 
     return kept, dropped
 

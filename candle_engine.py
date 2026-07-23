@@ -61,7 +61,8 @@ class CandleEngine:
 
     # -- registration -----------------------------------------------------
     def on_candle_close(self, cb):
-        self._callbacks.append(cb)
+        if cb not in self._callbacks:
+            self._callbacks.append(cb)
 
     # -- heikin ashi ------------------------------------------------------
     def _apply_ha(self, c):
@@ -217,6 +218,10 @@ class EnginePool:
         self._thread = None
 
     def on_candle_close(self, cb):
+        # guard against double-registration: a second START would otherwise
+        # evaluate every candle twice and send duplicate orders
+        if cb in self._callbacks:
+            return
         self._callbacks.append(cb)
         with self._lock:
             for e in self.engines.values():
@@ -236,6 +241,8 @@ class EnginePool:
 
     def start_roller(self, interval=1.0):
         """Background thread that closes candles on the minute boundary."""
+        self._stop.clear()          # allow restart after a previous stop()
+
         def _loop():
             while not self._stop.wait(interval):
                 now = datetime.now(IST)
@@ -252,6 +259,18 @@ class EnginePool:
 
     def stop(self):
         self._stop.set()
+
+    def reset(self):
+        """Stop the roller and drop all engines/callbacks - used between runs."""
+        self.stop()
+        t = self._thread
+        if t is not None and t.is_alive():
+            t.join(timeout=3)
+        self._thread = None
+        with self._lock:
+            self.engines.clear()
+        self._callbacks.clear()
+        self._stop = threading.Event()
 
     def snapshot(self):
         with self._lock:

@@ -66,8 +66,12 @@ STATUS_EVERY = 60
 # Same target applies to both CE and PE of an underlying. Toggles are per side,
 # so you get six independent switches: NIFTY CE, NIFTY PE, SENSEX CE, SENSEX PE,
 # CRUDEOILM CE, CRUDEOILM PE.
+#   "lots"           -> number of lots per entry. Order quantity is
+#                       lots x the exchange lot size (NIFTY 65, SENSEX 20,
+#                       CRUDEOILM 10 - taken from the scrip master).
+#                       A reversal sends 2 x this (close + open).
 SCRIPT_CONFIG = {
-    "NIFTY":     {"CE": True, "PE": True, "target_points": 0},
-    "SENSEX":    {"CE": True, "PE": True, "target_points": 0},
-    "CRUDEOILM": {"CE": True, "PE": True, "target_points": 0},
+    "NIFTY":     {"CE": True, "PE": True, "target_points": 0, "lots": 1},
+    "SENSEX":    {"CE": True, "PE": True, "target_points": 0, "lots": 1},
+    "CRUDEOILM": {"CE": True, "PE": True, "target_points": 0, "lots": 1},
 }

@@ -355,8 +355,8 @@ class App(ctk.CTk):
 
         head = ctk.CTkFrame(parent, fg_color=CLR_CARD, corner_radius=8)
         head.pack(fill="x", padx=16, pady=(0, 4))
-        for txt, w in [("SCRIPT", 160), ("CE", 90), ("PE", 90),
-                       ("TARGET (pts)", 160)]:
+        for txt, w in [("SCRIPT", 150), ("CE", 70), ("PE", 70),
+                       ("LOTS", 120), ("TARGET (pts)", 140)]:
             ctk.CTkLabel(head, text=txt, width=w, font=("Helvetica", 11, "bold"),
                          text_color=CLR_MUTED, anchor="w").pack(
                 side="left", padx=10, pady=8)
@@ -364,35 +364,40 @@ class App(ctk.CTk):
         self.script_widgets = {}
         for u in ("NIFTY", "SENSEX", "CRUDEOILM"):
             cfg = sc.SCRIPT_CONFIG.get(u, {"CE": True, "PE": True,
-                                           "target_points": 0})
+                                           "target_points": 0, "lots": 1})
             row = ctk.CTkFrame(parent, fg_color=CLR_PANEL, corner_radius=8,
                                border_width=1, border_color=CLR_BORDER)
             row.pack(fill="x", padx=16, pady=3)
 
-            ctk.CTkLabel(row, text=u, width=160, font=("Helvetica", 13, "bold"),
+            ctk.CTkLabel(row, text=u, width=150, font=("Helvetica", 13, "bold"),
                          text_color=CLR_TEXT, anchor="w").pack(
                 side="left", padx=10, pady=10)
 
-            ce = ctk.CTkSwitch(row, text="", width=90,
+            ce = ctk.CTkSwitch(row, text="", width=70,
                                progress_color=CLR_GREEN)
             (ce.select if cfg.get("CE", True) else ce.deselect)()
             ce.pack(side="left", padx=10)
 
-            pe = ctk.CTkSwitch(row, text="", width=90,
+            pe = ctk.CTkSwitch(row, text="", width=70,
                                progress_color=CLR_GREEN)
             (pe.select if cfg.get("PE", True) else pe.deselect)()
             pe.pack(side="left", padx=10)
 
-            tgt = ctk.CTkEntry(row, width=140, height=32)
+            lots = ctk.CTkEntry(row, width=100, height=32, justify="center")
+            lots.insert(0, str(cfg.get("lots", 1) or 1))
+            lots.pack(side="left", padx=10)
+
+            tgt = ctk.CTkEntry(row, width=120, height=32, justify="center")
             tgt.insert(0, str(cfg.get("target_points", 0) or 0))
             tgt.pack(side="left", padx=10)
 
-            self.script_widgets[u] = {"CE": ce, "PE": pe, "target": tgt}
+            self.script_widgets[u] = {"CE": ce, "PE": pe,
+                                      "lots": lots, "target": tgt}
 
         ctk.CTkLabel(parent,
-                     text="Live per-side switches also appear on the Positions "
-                          "tab once trading starts; turning one off there exits "
-                          "that leg immediately at LTP.",
+                     text="LOTS is the number of lots per entry - the order "
+                          "quantity is lots x exchange lot size (NIFTY 65, "
+                          "SENSEX 20, CRUDEOILM 10). A reversal sends double.",
                      font=("Helvetica", 11), text_color=CLR_MUTED,
                      justify="left").pack(anchor="w", padx=20, pady=(14, 6))
 
@@ -404,8 +409,12 @@ class App(ctk.CTk):
                 t = float(w["target"].get())
             except ValueError:
                 t = 0
+            try:
+                n = max(1, int(float(w["lots"].get())))
+            except ValueError:
+                n = 1
             out[u] = {"CE": bool(w["CE"].get()), "PE": bool(w["PE"].get()),
-                      "target_points": t}
+                      "target_points": t, "lots": n}
         return out
 
     ORDER_COLS = [("time", 90), ("mode", 70), ("action", 60), ("qty", 60),
@@ -553,6 +562,7 @@ class App(ctk.CTk):
         sc.SCRIPT_CONFIG.update(self._collect_script_config())
         for u, c in sc.SCRIPT_CONFIG.items():
             self.log(f"[CFG ] {u}: CE={c['CE']} PE={c['PE']} "
+                     f"lots={c.get('lots', 1)} "
                      f"target={c['target_points']:g}pt")
 
         self.runner = threading.Thread(target=self._run, daemon=True)
@@ -680,10 +690,12 @@ class App(ctk.CTk):
                             name, info["cfg"], bands[name],
                             spot_names[name], info["ref_bucket"])
                         if dropped and UNSUBSCRIBE_BAND_AFTER_LOCK:
+                            dropped = list(dropped)
                             for i in range(0, len(dropped), 100):
                                 try:
                                     client.un_subscribe(
-                                        instrument_tokens=dropped[i:i + 100])
+                                        instrument_tokens=list(
+                                            dropped[i:i + 100]))
                                 except Exception as e:
                                     print(f"[LOCK] unsubscribe: {e}")
                             print(f"       trading {len(kept)} legs, "
@@ -695,11 +707,21 @@ class App(ctk.CTk):
             print(f"[ERR ] {e}")
             print(traceback.format_exc())
         finally:
+            # Full teardown. Without this, legs from this run keep receiving
+            # ticks and can fire orders after STOP.
             try:
                 import paper_strategy as ps
-                ps.POOL.stop()
+                ps.reset_state()
+            except Exception as e:
+                print(f"[STOP] state reset: {e}")
+            try:
+                if self.client is not None:
+                    self.client.logout()
+                    print("[STOP] logged out")
             except Exception:
                 pass
+            self.client = None
+            print("[STOP] strategy stopped cleanly")
             sys.stdout = sys.__stdout__
 
     # ------------------------------------------------------------------
